@@ -1,0 +1,6 @@
+# Don't ship dev/runtime artifacts in the deployment bundle.
+bim_cache.json
+bim_report.html
+.venv/
+__pycache__/
+*.pyc

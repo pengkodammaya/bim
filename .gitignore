@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtualenv
+.venv/
+
+# Runtime artifacts (generated, not source)
+bim_cache.json
+bim_report.html
+
+# Vercel
+.vercel/
+
+# Editor / agent working files (not part of the app)
+.zcode/
