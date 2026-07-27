@@ -47,6 +47,11 @@ if os.environ.get("VERCEL"):
 else:
     CACHE_FILE = HERE / "bim_cache.json"
 REPORT_FILE = HERE / "bim_report.html"
+# Bundled snapshot of every BIM dictionary entry, used for fast ranked
+# local matching. Built by `python bim_lookup.py refresh-snapshot` and
+# committed so it ships with the app (including on Vercel, where the FS
+# is read-only and a cold-start fetch would be slow/fragile).
+DICTIONARY_FILE = HERE / "bim_dictionary.json"
 
 USER_AGENT = "BIM-Lookup/1.0 (personal use; contact: user)"
 
@@ -59,6 +64,7 @@ IMG_HOST = "https://images.bimsignbank.org"
 
 _ssl_warned = False
 _cache = None  # lazy-loaded dict
+_dictionary = None  # lazy-loaded list of normalized records (or None if no snapshot)
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +166,56 @@ def http_head_ok(url: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Bundled dictionary snapshot (for fast ranked local matching)
+# --------------------------------------------------------------------------- #
+def _load_dictionary() -> list[dict] | None:
+    """Load and normalize the bundled dictionary snapshot, memoized.
+
+    Returns None if no snapshot exists yet (first run, before
+    `refresh-snapshot` is run) so callers can fall back to live API
+    lookups. The returned list is the single source of truth for
+    `match_word`; each entry carries the normalized comparison keys
+    alongside the record fields the renderer expects.
+    """
+    global _dictionary
+    if _dictionary is not None:
+        return _dictionary
+
+    try:
+        blob = json.loads(DICTIONARY_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None  # no snapshot yet -> live API fallback handles it
+
+    records = blob.get("records") if isinstance(blob, dict) else None
+    if not isinstance(records, list):
+        return None
+
+    out: list[dict] = []
+    for rec in records:
+        word = rec.get("word") or ""
+        perkataan = rec.get("perkataan") or ""
+        out.append({
+            # Renderer-facing fields (same shape as _first_record):
+            "id": rec.get("id"),
+            "word": word,
+            "perkataan": perkataan,
+            "video": rec.get("video") or "",
+            "group_category": rec.get("group_category") or "",
+            # Pre-normalized comparison keys. word_norm strips spaces too,
+            # so "chicken pox" compares equal to a "chicken pox" query
+            # (both -> "chickenpox"); word_tokens keeps the boundary info
+            # needed for word-boundary and per-token fuzzy matching.
+            "word_norm": _normalize_token(word),
+            "perkataan_norm": _normalize_token(perkataan),
+            "word_tokens": set(_normalize_token(t)
+                               for t in word.lower().split()
+                               if _normalize_token(t)),
+        })
+    _dictionary = out
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Strapi query helpers
 # --------------------------------------------------------------------------- #
 def _query(filters: list[tuple[str, str, str]]) -> str:
@@ -202,6 +258,192 @@ def lookup_word(token: str) -> dict | None:
         ("Word", "$startsWithi", token),
         ("Perkataan", "$startsWithi", token),
     ])
+
+
+# --------------------------------------------------------------------------- #
+# Ranked local matching over the bundled dictionary snapshot
+# --------------------------------------------------------------------------- #
+# Score tiers (lower = better, first non-None wins):
+#   0  exact English        4  stem match (strip -ing/-ed/-er/...)
+#   1  exact Malay          5  substring (token length >= 4)
+#   2  prefix EN/Malay      6  fuzzy Levenshtein (token length >= 4)
+#   3  word-boundary match
+# Sub-scores add a small tiebreak (e.g. prefix by how much longer the entry
+# is than the token, fuzzy by edit distance) so the closest entry wins.
+_TIER_EXACT_EN, _TIER_EXACT_MY = 0, 1
+_TIER_PREFIX, _TIER_WORD_BOUNDARY, _TIER_STEM = 2, 3, 4
+_TIER_SUBSTRING, _TIER_FUZZY = 5, 6
+_FUZZY_MAX_DISTANCE = 2
+
+_SUFFIXES = ("ing", "edly", "ed", "er", "est", "ly", "ment", "ness",
+             "s", "es", "ies")
+
+
+def _normalize_token(token: str) -> str:
+    """Lowercase + strip apostrophes/digits for comparison."""
+    return re.sub(r"[^a-z]", "", (token or "").lower())
+
+
+def _stem(token: str) -> tuple[str, ...]:
+    """Candidate stems for `token` (best first), or empty if unstemmable.
+
+    Very light rule-based stemming -- enough to bridge common inflections
+    (running->run, reading->read, stopped->stop, cities->city). Returns
+    multiple candidates where ambiguity exists: a doubled final consonant
+    after -ing/-ed may be the inflection (running->run) or part of the
+    root (falling->fall), so we emit both and let _score_match pick the
+    one that actually occurs in the dictionary.
+    """
+    t = _normalize_token(token)
+    if len(t) < 4:
+        return ()
+    # Longest matching suffix wins so "cities" -> "ies" (-> "city") rather
+    # than "es"/"s" (-> "citi"/"citie").
+    matching = [s for s in _SUFFIXES
+                if t.endswith(s) and len(t) - len(s) >= 3]
+    if not matching:
+        return ()
+    suf = max(matching, key=len)
+    base = t[: -len(suf)]
+    if suf == "ies":
+        cands = [base + "y"]                 # cities -> city
+    else:
+        cands = [base]                       # reading -> read
+        if (len(base) >= 3 and base[-1] == base[-2]
+                and base[-1] not in "aeiou"):
+            cands.append(base[:-1])          # running -> run ; falling -> fal
+    return tuple(c for c in cands if 3 <= len(c) < len(t))
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Standard two-row Levenshtein edit distance."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(
+                prev[j] + 1,
+                cur[j - 1] + 1,
+                prev[j - 1] + (ca != cb),
+            ))
+        prev = cur
+    return prev[-1]
+
+
+def _score_match(token_norm: str, rec: dict) -> int | None:
+    """Return a sortable score (lower = better) or None if no match.
+
+    `token_norm` is already _normalize_token'd. `rec` is a normalized
+    dictionary entry from _load_dictionary (has word_lower/perkataan_lower/
+    word_tokens). The score packs the tier into the high digits and a
+    tiebreak into the low digits so a single integer sorts correctly.
+    """
+    if not token_norm:
+        return None
+    word = rec["word_norm"]
+    perkataan = rec["perkataan_norm"]
+
+    if word == token_norm:
+        return _TIER_EXACT_EN
+    if perkataan == token_norm:
+        return _TIER_EXACT_MY
+
+    if word.startswith(token_norm):
+        return _TIER_PREFIX * 1000 + (len(word) - len(token_norm))
+    if perkataan.startswith(token_norm):
+        return _TIER_PREFIX * 1000 + 100 + (len(perkataan) - len(token_norm))
+
+    if token_norm in rec["word_tokens"]:
+        return _TIER_WORD_BOUNDARY
+
+    # Stem: re-run exact/prefix on each stem candidate so "reading" still
+    # picks "Reading" at exact, or "running" -> "run"; the candidate that
+    # actually occurs in the dictionary wins.
+    best_stem: int | None = None
+    for stem in _stem(token_norm):
+        if word == stem or perkataan == stem:
+            return _TIER_STEM
+        if word.startswith(stem):
+            score = _TIER_STEM * 1000 + (len(word) - len(stem))
+            if best_stem is None or score < best_stem:
+                best_stem = score
+    if best_stem is not None:
+        return best_stem
+
+    # Substring + fuzzy are gated on token length to avoid short queries
+    # ("run") dragging in unrelated entries ("Drunk", "Baju Kurung"); the
+    # tiers above already cover short words well. Both are evaluated per
+    # whole-word token of the entry rather than against the squashed
+    # compound, so "mice" doesn't catch "vermicelli" inside "Bee Hoon
+    # (Rice Vermicelli, ...)". Substring requires a 5+ char token and a
+    # matching first letter, which keeps genuine partial queries
+    # ("standing" -> "Understand") while dropping short collisions
+    # ("mice" -> "rice").
+    if len(token_norm) >= 5:
+        best_sub: int | None = None
+        for wt in rec["word_tokens"]:
+            if (len(wt) >= len(token_norm) and wt[0] == token_norm[0]
+                    and token_norm in wt):
+                score = _TIER_SUBSTRING * 1000 + (len(wt) - len(token_norm))
+                if best_sub is None or score < best_sub:
+                    best_sub = score
+        if best_sub is not None:
+            return best_sub
+    if len(token_norm) >= 4:
+        # Fuzzy: first letter must match -- typos overwhelmingly keep it,
+        # so this cleanly rejects "mice"->"rice"/"xyzzy"->"dizzy" while
+        # still catching real typos like "childrn"->"children".
+        best_fuzzy: int | None = None
+        for wt in rec["word_tokens"]:
+            if (len(wt) >= 4 and wt[0] == token_norm[0]
+                    and abs(len(wt) - len(token_norm)) <= _FUZZY_MAX_DISTANCE):
+                dist = _levenshtein(token_norm, wt)
+                if 0 < dist <= _FUZZY_MAX_DISTANCE:
+                    score = _TIER_FUZZY * 1000 + dist
+                    if best_fuzzy is None or score < best_fuzzy:
+                        best_fuzzy = score
+        if best_fuzzy is not None:
+            return best_fuzzy
+    return None
+
+
+def match_word(token: str) -> dict | None:
+    """Best ranked match for `token` over the bundled snapshot, or None.
+
+    Returns the same dict shape lookup_word/_first_record produce (id, word,
+    perkataan, video, group_category), so the render layer is unchanged.
+    """
+    dictionary = _load_dictionary()
+    if not dictionary:
+        return None  # no snapshot -> caller falls back to lookup_word
+
+    token_norm = _normalize_token(token)
+    if not token_norm:
+        return None
+
+    best_score: int | None = None
+    best_rec: dict | None = None
+    for rec in dictionary:
+        score = _score_match(token_norm, rec)
+        if score is not None and (best_score is None or score < best_score):
+            best_score, best_rec = score, rec
+            if score == _TIER_EXACT_EN:
+                break  # can't do better than an exact English match
+    if best_rec is None:
+        return None
+    return {
+        "id": best_rec["id"],
+        "word": best_rec["word"],
+        "perkataan": best_rec["perkataan"],
+        "video": best_rec["video"],
+        "group_category": best_rec["group_category"],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -777,6 +1019,109 @@ def serve(port: int, open_browser: bool) -> int:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def refresh_snapshot(page_size: int = 100) -> int:
+    """Fetch every BIM entry and write it to bim_dictionary.json.
+
+    Pages through the Strapi collection with use_cache=False so the result
+    always reflects the live site, regardless of any stale entries in the
+    response cache. Keeps only the fields the matcher/renderer need, so the
+    snapshot stays small (~1-2 MB for ~2900 entries).
+    """
+    print(f"[info] building dictionary snapshot from {API_HOST} ...",
+          file=sys.stderr)
+    records: list[dict] = []
+    page = 1
+    total = None
+    while True:
+        url = (f"{API_HOST}/api/bims?populate=category_group"
+               f"&pagination[pageSize]={page_size}"
+               f"&pagination[page]={page}")
+        try:
+            data = http_get_json(url, use_cache=False)
+        except RuntimeError as exc:
+            print(f"[error] failed fetching page {page}: {exc}",
+                  file=sys.stderr)
+            if not records:
+                return 1
+            break  # keep what we have so far rather than abort entirely
+        rows = data.get("data") or []
+        if not rows:
+            break
+        for r in rows:
+            rec = _first_record(rows=[r])
+            if not rec or not (rec.get("word") or rec.get("perkataan")):
+                continue  # skip blank entries
+            records.append({
+                "id": rec.get("id"),
+                "word": rec.get("word") or "",
+                "perkataan": rec.get("perkataan") or "",
+                "video": rec.get("video") or "",
+                "group_category": rec.get("group_category") or "",
+            })
+        if total is None:
+            total = data.get("meta", {}).get("pagination", {}).get("total")
+        print(f"  page {page}: {len(rows)} rows "
+              f"({len(records)} kept so far{f' of ~{total}' if total else ''})",
+              file=sys.stderr)
+        if len(rows) < page_size or (total and len(records) >= total):
+            break
+        page += 1
+
+    if not records:
+        print("[error] no records fetched; snapshot not written.",
+              file=sys.stderr)
+        return 1
+
+    blob = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "count": len(records),
+        "records": records,
+    }
+    DICTIONARY_FILE.write_text(
+        json.dumps(blob, ensure_ascii=False, indent=0),
+        encoding="utf-8",
+    )
+    # Invalidate the in-memory cache so subsequent lookups in this process
+    # pick up the fresh data instead of the pre-refresh None.
+    global _dictionary
+    _dictionary = None
+    print(f"[done] wrote {len(records)} records to {DICTIONARY_FILE}",
+          file=sys.stderr)
+    return 0
+
+
+_snapshot_warned = False
+
+
+def _lookup_token(token: str) -> dict | None:
+    """Best match for `token`, via the local snapshot when available.
+
+    Falls back to the live API (lookup_word) only when no snapshot is
+    loaded yet -- the snapshot is authoritative between refreshes, so a
+    miss *with* a loaded snapshot is a genuine miss. Network errors in the
+    fallback path are swallowed into None so a single bad lookup never
+    breaks the whole phrase.
+    """
+    global _snapshot_warned
+    rec = match_word(token)
+    if rec is not None or _load_dictionary() is not None:
+        # Snapshot loaded: match_word's answer (hit or miss) is final.
+        return rec
+
+    # No snapshot yet -- fall back to a live API probe, once per process
+    # mention that a snapshot would make this faster and more accurate.
+    if not _snapshot_warned:
+        print(f"[hint] no dictionary snapshot found ({DICTIONARY_FILE.name}); "
+              f"running live API lookups. Build one with: "
+              f"python bim_lookup.py refresh-snapshot",
+              file=sys.stderr)
+        _snapshot_warned = True
+    try:
+        return lookup_word(token)
+    except RuntimeError:
+        return None
+
+
 def search_phrase(phrase: str) -> tuple[str, str,
                                         list[tuple[str, dict | None]]]:
     """Run a phrase/word lookup. Shared by the CLI and the web server.
@@ -794,21 +1139,14 @@ def search_phrase(phrase: str) -> tuple[str, str,
 
     # Phrase-as-single-entry attempt.
     if full:
-        try:
-            rec = lookup_word(full)
-        except RuntimeError:
-            rec = None
+        rec = _lookup_token(full)
         if rec is not None:
             results.append((full, rec))
             return phrase, "phrase", results
 
     # Per-word fallback.
     for token in tokens:
-        try:
-            rec = lookup_word(token)
-        except RuntimeError:
-            rec = None
-        results.append((token, rec))
+        results.append((token, _lookup_token(token)))
     return phrase, "words", results
 
 
@@ -816,8 +1154,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Look up BIM (Malaysian Sign Language) signs for a phrase.",
         epilog='examples:\n'
-               '  python bim_lookup.py "good morning"   # one-shot HTML report\n'
-               '  python bim_lookup.py serve             # interactive web app',
+               '  python bim_lookup.py "good morning"          # one-shot HTML report\n'
+               '  python bim_lookup.py serve                    # interactive web app\n'
+               '  python bim_lookup.py refresh-snapshot         # (re)build bim_dictionary.json',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("phrase", nargs="*",
@@ -851,6 +1190,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.phrase and args.phrase[0] == "serve":
         return serve(args.port, open_browser=not args.no_browser)
 
+    # `refresh-snapshot` subcommand: (re)build the bundled dictionary.
+    if args.phrase and args.phrase[0] == "refresh-snapshot":
+        return refresh_snapshot()
+
     if not args.phrase:
         # No phrase and not serving -> show help.
         parser.print_help()
@@ -875,12 +1218,7 @@ def main(argv: list[str] | None = None) -> int:
     if full:
         print(f"[info] trying phrase {full!r} as a single entry...",
               file=sys.stderr)
-        try:
-            rec = lookup_word(full)
-        except RuntimeError as exc:
-            print(f"[warn] phrase lookup failed for {full!r}: {exc}",
-                  file=sys.stderr)
-            rec = None
+        rec = _lookup_token(full)
         phrase_hit = rec is not None
         if phrase_hit:
             results.append((full, rec))
@@ -896,12 +1234,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{'s' if len(tokens) != 1 else ''}: {', '.join(tokens)}",
               file=sys.stderr)
         for token in tokens:
-            try:
-                rec = lookup_word(token)
-            except RuntimeError as exc:
-                print(f"[warn] lookup failed for {token!r}: {exc}",
-                      file=sys.stderr)
-                rec = None
+            rec = _lookup_token(token)
             results.append((token, rec))
             status = (f"{rec['word']!r} "
                       f"({rec.get('group_category') or 'no category'})"
